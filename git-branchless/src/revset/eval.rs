@@ -4,16 +4,18 @@ use std::sync::Arc;
 
 use eden_dag::errors::BackendError;
 use eden_dag::DagAlgorithm;
+use eyre::Context as EyreContext;
 use itertools::Itertools;
 use lib::core::effects::{Effects, OperationType};
 use once_cell::unsync::OnceCell;
 use thiserror::Error;
 
 use lib::core::dag::{CommitSet, Dag};
-use lib::git::{Repo, ResolvedReferenceInfo};
+use lib::git::{ConfigRead, Repo, ResolvedReferenceInfo};
 use tracing::instrument;
 
 use super::builtins::FUNCTIONS;
+use super::parser::parse;
 use super::pattern::{Pattern, PatternError};
 use super::Expr;
 
@@ -204,14 +206,33 @@ pub(super) fn eval_name(ctx: &mut Context, name: &str) -> EvalResult {
 }
 
 pub(super) fn eval_fn(ctx: &mut Context, name: &str, args: &[Expr]) -> EvalResult {
-    let function = FUNCTIONS
-        .get(name)
-        .ok_or_else(|| EvalError::UnboundFunction {
-            name: name.to_owned(),
-            available_names: FUNCTIONS.keys().sorted().copied().collect(),
-        })?;
+    if let Some(function) = FUNCTIONS.get(name) {
+        return function(ctx, name, args);
+    }
 
-    function(ctx, name, args)
+    let alias_key = format!("git-branchless.revsets.alias.{}", name);
+    let alias_template = ctx
+        .repo
+        .get_readonly_config()
+        .map_err(EvalError::OtherError)?
+        .get::<String, String>(alias_key)
+        .map_err(EvalError::OtherError)?;
+    if let Some(mut alias_template) = alias_template {
+        for (i, arg) in args.iter().enumerate() {
+            alias_template =
+                alias_template.replace(format!("${}", i + 1).as_str(), format!("{}", arg).as_str());
+        }
+        let expr = parse(&alias_template)
+            .wrap_err("Parsing alias expression")
+            .map_err(EvalError::OtherError)?;
+        let commits = eval_inner(ctx, &expr);
+        return commits;
+    }
+
+    Err(EvalError::UnboundFunction {
+        name: name.to_owned(),
+        available_names: FUNCTIONS.keys().sorted().copied().collect(),
+    })
 }
 
 #[instrument]
@@ -929,6 +950,80 @@ mod tests {
             insta::assert_debug_snapshot!(eval_and_sort(&effects, &repo, &mut dag, &expr), @r###"
             Ok(
                 [],
+            )
+            "###);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_eval_aliases() -> eyre::Result<()> {
+        let git = make_git()?;
+        git.init_repo()?;
+
+        git.detach_head()?;
+        let test1_oid = git.commit_file("test1", 1)?;
+        let _test2_oid = git.commit_file("test2", 2)?;
+        let _test3_oid = git.commit_file("test3", 3)?;
+
+        git.run(&["config", "git-branchless.revsets.alias.oldest", "roots($1)"])?;
+
+        git.run(&[
+            "config",
+            "git-branchless.revsets.alias.grandChildren",
+            "children(children($1))",
+        ])?;
+
+        let effects = Effects::new_suppress_for_test(Glyphs::text());
+        let repo = git.get_repo()?;
+        let conn = repo.get_db_conn()?;
+        let event_log_db = EventLogDb::new(&conn)?;
+        let event_replayer = EventReplayer::from_event_log_db(&effects, &repo, &event_log_db)?;
+        let event_cursor = event_replayer.make_default_cursor();
+        let references_snapshot = repo.get_references_snapshot()?;
+        let mut dag = Dag::open_and_sync(
+            &effects,
+            &repo,
+            &event_replayer,
+            event_cursor,
+            &references_snapshot,
+        )?;
+
+        {
+            let expr = Expr::FunctionCall(
+                Cow::Borrowed("oldest"),
+                vec![Expr::FunctionCall(Cow::Borrowed("stack"), vec![])],
+            );
+            insta::assert_debug_snapshot!(eval_and_sort(&effects, &repo, &mut dag, &expr), @r###"
+            Ok(
+                [
+                    Commit {
+                        inner: Commit {
+                            id: 62fc20d2a290daea0d52bdc2ed2ad4be6491010e,
+                            summary: "create test1.txt",
+                        },
+                    },
+                ],
+            )
+            "###);
+        }
+
+        {
+            let expr = Expr::FunctionCall(
+                Cow::Borrowed("grandChildren"),
+                vec![Expr::Name(Cow::Owned(test1_oid.to_string()))],
+            );
+            insta::assert_debug_snapshot!(eval_and_sort(&effects, &repo, &mut dag, &expr), @r###"
+            Ok(
+                [
+                    Commit {
+                        inner: Commit {
+                            id: 70deb1e28791d8e7dd5a1f0c871a51b91282562f,
+                            summary: "create test3.txt",
+                        },
+                    },
+                ],
             )
             "###);
         }
