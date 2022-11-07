@@ -231,14 +231,20 @@ mod graph {
                         // Find the nearest ancestor that is included in the graph and
                         // also on the same branch.
 
-                        let nearest_branch_ancestor = match dag
-                            .find_path_to_main_branch(effects, CommitSet::from(parent_oid))?
-                        {
-                            Some(path_to_main_branch) => dag.query().heads_ancestors(
-                                path_to_main_branch.intersection(&graph_vertices),
-                            )?,
+                        let parent_set = CommitSet::from(parent_oid);
+                        let merge_base = dag
+                            .query()
+                            .gca_one(dag.main_branch_commit.union(&parent_set))?;
+
+                        let path_to_main_branch = match merge_base {
+                            Some(merge_base) => {
+                                dag.query().range(CommitSet::from(merge_base), parent_set)?
+                            }
                             None => CommitSet::empty(),
                         };
+                        let nearest_branch_ancestor = dag
+                            .query()
+                            .heads_ancestors(path_to_main_branch.intersection(&graph_vertices))?;
 
                         let ancestor_oids = commit_set_to_vec(&nearest_branch_ancestor)?;
                         for ancestor_oid in ancestor_oids.iter() {
@@ -414,6 +420,7 @@ mod graph {
 mod render {
     use std::cmp::Ordering;
     use std::collections::HashSet;
+    use std::convert::TryFrom;
 
     use cursive::theme::Effect;
     use cursive::utils::markup::StyledString;
@@ -440,7 +447,6 @@ mod render {
     /// Returns the list such that the topologically-earlier subgraphs are first in
     /// the list (i.e. those that would be rendered at the bottom of the smartlog).
     fn split_commit_graph_by_roots(
-        effects: &Effects,
         repo: &Repo,
         dag: &Dag,
         graph: &SmartlogGraph,
@@ -465,10 +471,13 @@ mod render {
                 _ => return lhs_oid.cmp(rhs_oid),
             };
 
-            let merge_base_oid = dag.get_one_merge_base_oid(effects, repo, *lhs_oid, *rhs_oid);
+            let merge_base_oid = dag
+                .query()
+                .gca_one(vec![*lhs_oid, *rhs_oid].into_iter().collect::<CommitSet>());
             let merge_base_oid = match merge_base_oid {
                 Err(_) => return lhs_oid.cmp(rhs_oid),
-                Ok(merge_base_oid) => merge_base_oid,
+                Ok(None) => None,
+                Ok(Some(merge_base_oid)) => NonZeroOid::try_from(merge_base_oid).ok(),
             };
 
             match merge_base_oid {
@@ -698,7 +707,7 @@ mod render {
         head_oid: Option<NonZeroOid>,
         commit_descriptors: &mut [&mut dyn NodeDescriptor],
     ) -> eyre::Result<Vec<StyledString>> {
-        let root_oids = split_commit_graph_by_roots(effects, repo, dag, graph);
+        let root_oids = split_commit_graph_by_roots(repo, dag, graph);
         let lines = get_output(
             effects.get_glyphs(),
             dag,
