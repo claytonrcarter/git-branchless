@@ -28,6 +28,7 @@ use lib::git::{GitRunInfo, Repo};
 pub use graph::{make_smartlog_graph, SmartlogGraph};
 pub use render::{render_graph, SmartlogOptions};
 
+use crate::opts::Revset;
 use crate::revset::resolve_commits;
 
 mod graph {
@@ -500,7 +501,7 @@ mod render {
     }
 
     /// Options for rendering the smartlog.
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     pub struct SmartlogOptions {
         /// The point in time at which to show the smartlog. If not provided,
         /// renders the smartlog as of the current time. If negative, is treated
@@ -509,19 +510,9 @@ mod render {
 
         /// The commits to render. These commits and their ancestors up to the
         /// main branch will be rendered.
-        pub revset: Revset,
+        pub revset: Option<Revset>,
 
         pub resolve_revset_options: ResolveRevsetOptions,
-    }
-
-    impl Default for SmartlogOptions {
-        fn default() -> Self {
-            Self {
-                event_id: Default::default(),
-                revset: Revset("draft() | branches() | @".to_string()),
-                resolve_revset_options: Default::default(),
-            }
-        }
     }
 }
 
@@ -566,13 +557,13 @@ pub fn smartlog(
         &references_snapshot,
     )?;
 
-    let commits = match resolve_commits(
-        effects,
-        &repo,
-        &mut dag,
-        &[revset.clone()],
-        resolve_revset_options,
-    ) {
+    let revset = match revset {
+        Some(revset) => revset.clone(),
+        None => Revset("draft() | branches() | @".to_string()),
+    };
+
+    let commits = match resolve_commits(effects, &repo, &mut dag, &[revset], resolve_revset_options)
+    {
         Ok(result) => match result.as_slice() {
             [commit_set] => commit_set.clone(),
             other => panic!(
