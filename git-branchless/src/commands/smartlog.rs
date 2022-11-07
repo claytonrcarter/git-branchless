@@ -56,12 +56,18 @@ mod graph {
 
         /// The OID of the parent node in the smartlog commit graph.
         ///
-        /// This is different from inspecting `commit.parents()`,& since the smartlog
+        /// This is different from inspecting `commit.parents()`, since the smartlog
         /// will hide most nodes from the commit graph, including parent nodes.
         pub parent: Option<NonZeroOid>,
 
         /// The OIDs of the children nodes in the smartlog commit graph.
         pub children: Vec<NonZeroOid>,
+
+        /// Does this commit have any non-immediate ancestor nodes in the smartlog commit graph.
+        pub has_ancestors: bool,
+
+        /// The OIDs of any non-immediate descendant nodes in the smartlog commit graph.
+        pub descendants: Vec<NonZeroOid>,
 
         /// Indicates that this is a commit to the main branch.
         ///
@@ -84,11 +90,20 @@ mod graph {
         /// where you commit directly to the main branch and then later rewrite the
         /// commit.
         pub is_obsolete: bool,
+
+        /// Indicates that this commit has descendants, but that none of them
+        /// are included in the graph.
+        ///
+        /// This allows us to indicate this "false head" to the user. Otherwise,
+        /// this commit would look like a normal, descendant-less head.
+        pub is_false_head: bool,
     }
 
     /// Graph of commits that the user is working on.
     pub struct SmartlogGraph<'repo> {
         pub nodes: HashMap<NonZeroOid, Node<'repo>>,
+
+        pub variant: SmartlogVariant,
     }
 
     impl<'repo> SmartlogGraph<'repo> {
@@ -115,32 +130,36 @@ mod graph {
         }
     }
 
-    /// Find additional commits that should be displayed.
+    /// Build the smartlog graph by finding additional commits that should be displayed.
     ///
     /// For example, if you check out a commit that has intermediate parent commits
     /// between it and the main branch, those intermediate commits should be shown
     /// (or else you won't get a good idea of the line of development that happened
     /// for this commit since the main branch).
     #[instrument]
-    fn walk_from_commits<'repo>(
+    fn build_graph<'repo>(
         effects: &Effects,
         repo: &'repo Repo,
         dag: &Dag,
         public_commits: &CommitSet,
-        active_heads: &CommitSet,
+        commits: &CommitSet,
+        smartlog_variant: SmartlogVariant,
     ) -> eyre::Result<SmartlogGraph<'repo>> {
         let mut graph: HashMap<NonZeroOid, Node> = {
             let mut result = HashMap::new();
-            for vertex in commit_set_to_vec(active_heads)? {
+            for vertex in commit_set_to_vec(commits)? {
                 let vertex = CommitSet::from(vertex);
                 let merge_bases = dag.query().gca_all(dag.main_branch_commit.union(&vertex))?;
-                let intermediate_commits = if merge_bases.is_empty()? {
+                let vertices = if merge_bases.is_empty()? {
                     vertex
                 } else {
-                    dag.query().range(merge_bases, vertex)?
+                    match smartlog_variant {
+                        SmartlogVariant::Connected => dag.query().range(merge_bases, vertex)?,
+                        SmartlogVariant::Sparse(_) => vertex.union(&merge_bases),
+                    }
                 };
 
-                for oid in commit_set_to_vec(&intermediate_commits)? {
+                for oid in commit_set_to_vec(&vertices)? {
                     let object = match repo.find_commit(oid)? {
                         Some(commit) => NodeObject::Commit { commit },
                         None => {
@@ -155,8 +174,11 @@ mod graph {
                             object,
                             parent: None,         // populated below
                             children: Vec::new(), // populated below
+                            has_ancestors: false,
+                            descendants: Vec::new(), // populated below
                             is_main: public_commits.contains(&oid.into())?,
                             is_obsolete: dag.query_obsolete_commits().contains(&oid.into())?,
+                            is_false_head: false,
                         },
                     );
                 }
@@ -164,32 +186,116 @@ mod graph {
             result
         };
 
-        // Find immediate parent-child links.
-        let links: Vec<(NonZeroOid, NonZeroOid)> = {
-            let non_main_node_oids =
-                graph.iter().filter_map(
-                    |(child_oid, node)| if !node.is_main { Some(child_oid) } else { None },
-                );
+        let mut immediate_links: Vec<(NonZeroOid, NonZeroOid)> = Vec::new();
+        let mut non_immediate_links: Vec<(NonZeroOid, NonZeroOid)> = Vec::new();
 
-            let mut links = Vec::new();
-            for child_oid in non_main_node_oids {
-                let parent_vertexes = dag.query().parents(CommitSet::from(*child_oid))?;
-                let parent_oids = commit_set_to_vec(&parent_vertexes)?;
-                for parent_oid in parent_oids {
-                    if graph.contains_key(&parent_oid) {
-                        links.push((*child_oid, parent_oid))
+        let non_main_node_oids =
+            graph
+                .iter()
+                .filter_map(|(child_oid, node)| if !node.is_main { Some(child_oid) } else { None });
+
+        let graph_vertices: CommitSet = graph.keys().cloned().collect();
+        for child_oid in non_main_node_oids {
+            let parent_vertices = dag.query().parents(CommitSet::from(*child_oid))?;
+
+            // Find immediate parent-child links.
+            let (parent_oids, parents_in_graph) = match smartlog_variant {
+                SmartlogVariant::Connected => {
+                    let parent_oids = commit_set_to_vec(&parent_vertices)?;
+                    (parent_oids, CommitSet::empty())
+                }
+                SmartlogVariant::Sparse(_) => {
+                    let parents_in_graph = parent_vertices.intersection(&graph_vertices);
+                    let parent_oids = commit_set_to_vec(&parents_in_graph)?;
+                    (parent_oids, parents_in_graph)
+                }
+            };
+            for parent_oid in parent_oids {
+                immediate_links.push((*child_oid, parent_oid))
+            }
+            match smartlog_variant {
+                SmartlogVariant::Connected => {
+                    // No need to find non-immediate links.
+                }
+                SmartlogVariant::Sparse(_)
+                    if parent_vertices.count()? == parents_in_graph.count()? =>
+                {
+                    // All parents have been handled, no need to look for
+                    // non-immediate links
+                }
+                SmartlogVariant::Sparse(_) => {
+                    // Find non-immediate ancestor links.
+                    let excluded_parents = parent_vertices.difference(&graph_vertices);
+                    let excluded_parent_oids = commit_set_to_vec(&excluded_parents)?;
+                    for parent_oid in excluded_parent_oids {
+                        // Find the nearest ancestor that is included in the graph and
+                        // also on the same branch.
+
+                        let nearest_branch_ancestor = match dag
+                            .find_path_to_main_branch(effects, CommitSet::from(parent_oid))?
+                        {
+                            Some(path_to_main_branch) => dag.query().heads_ancestors(
+                                path_to_main_branch.intersection(&graph_vertices),
+                            )?,
+                            None => CommitSet::empty(),
+                        };
+
+                        let ancestor_oids = commit_set_to_vec(&nearest_branch_ancestor)?;
+                        for ancestor_oid in ancestor_oids.iter() {
+                            non_immediate_links.push((*ancestor_oid, *child_oid));
+                        }
                     }
                 }
             }
-            links
-        };
+        }
 
-        for (child_oid, parent_oid) in links.iter() {
+        for (child_oid, parent_oid) in immediate_links.iter() {
             graph.get_mut(child_oid).unwrap().parent = Some(*parent_oid);
             graph.get_mut(parent_oid).unwrap().children.push(*child_oid);
         }
 
-        Ok(SmartlogGraph { nodes: graph })
+        match smartlog_variant {
+            SmartlogVariant::Connected => {
+                // A connected smartlog doesn't need to process non-immediate
+                // links or false heads.
+            }
+            SmartlogVariant::Sparse(_) => {
+                for (ancestor_oid, descendent_oid) in non_immediate_links.iter() {
+                    graph.get_mut(descendent_oid).unwrap().has_ancestors = true;
+                    graph
+                        .get_mut(ancestor_oid)
+                        .unwrap()
+                        .descendants
+                        .push(*descendent_oid);
+                }
+
+                for (oid, node) in graph.iter_mut() {
+                    let oid_set = CommitSet::from(*oid);
+                    let is_main_head = !dag.main_branch_commit.intersection(&oid_set).is_empty()?;
+                    let ancestor_of_main = node.is_main && !is_main_head;
+                    let has_descendants_in_graph =
+                        !node.children.is_empty() || !node.descendants.is_empty();
+
+                    if ancestor_of_main || has_descendants_in_graph {
+                        continue;
+                    }
+
+                    // This node has no descendants in the graph, so it's a
+                    // false head if it has *any* (non-obsolete) children.
+                    let children_not_in_graph = dag
+                        .query()
+                        .children(oid_set)?
+                        .difference(&dag.query_obsolete_commits());
+
+                    node.is_false_head = !children_not_in_graph.is_empty()?;
+                }
+            }
+        }
+
+        Ok(SmartlogGraph {
+            nodes: graph,
+            variant: smartlog_variant,
+        })
     }
 
     /// Sort children nodes of the commit graph in a standard order, for determinism
@@ -278,15 +384,27 @@ mod graph {
             let public_commits = dag.query_public_commits()?;
 
             let commits = match smartlog_variant {
-                SmartlogVariant::Connected => commits,
-                SmartlogVariant::Sparse(_) => commits,
+                SmartlogVariant::Connected => commits.clone(),
+                SmartlogVariant::Sparse(_) => {
+                    // HEAD and main head must be included
+                    commits
+                        .union(&dag.head_commit)
+                        .union(&dag.main_branch_commit)
+                }
             };
 
-            for oid in commit_set_to_vec(commits)? {
+            for oid in commit_set_to_vec(&commits)? {
                 mark_commit_reachable(repo, oid)?;
             }
 
-            walk_from_commits(&effects, repo, dag, public_commits, commits)?
+            build_graph(
+                &effects,
+                repo,
+                dag,
+                public_commits,
+                &commits,
+                smartlog_variant,
+            )?
         };
         sort_children(&mut graph);
         Ok(graph)
@@ -295,6 +413,7 @@ mod graph {
 
 mod render {
     use std::cmp::Ordering;
+    use std::collections::HashSet;
 
     use cursive::theme::Effect;
     use cursive::utils::markup::StyledString;
@@ -329,7 +448,10 @@ mod render {
         let mut root_commit_oids: Vec<NonZeroOid> = graph
             .nodes
             .iter()
-            .filter(|(_oid, node)| node.parent.is_none())
+            .filter(|(_oid, node)| match graph.variant {
+                SmartlogVariant::Connected => node.parent.is_none(),
+                SmartlogVariant::Sparse(_) => node.parent.is_none() && node.is_main,
+            })
             .map(|(oid, _node)| oid)
             .copied()
             .collect();
@@ -393,7 +515,13 @@ mod render {
             (true, true, true) => glyphs.commit_main_obsolete_head,
         };
 
-        let first_line = {
+        let mut lines = vec![];
+
+        if current_node.has_ancestors {
+            lines.push(StyledString::plain(glyphs.vertical_ellipsis.to_string()));
+        };
+
+        lines.push({
             let mut first_line = StyledString::new();
             first_line.append_plain(cursor);
             first_line.append_plain(" ");
@@ -403,36 +531,58 @@ mod render {
             } else {
                 first_line
             }
+        });
+
+        if current_node.is_false_head {
+            lines.push(StyledString::plain(glyphs.vertical_ellipsis.to_string()));
         };
 
-        let mut lines = vec![first_line];
         let children: Vec<_> = current_node
             .children
             .iter()
             .filter(|child_oid| graph.nodes.contains_key(child_oid))
             .copied()
             .collect();
-        for (child_idx, child_oid) in children.iter().enumerate() {
+        let descendants: HashSet<_> = match graph.variant {
+            SmartlogVariant::Connected => HashSet::new(),
+            SmartlogVariant::Sparse(_) => current_node
+                .descendants
+                .iter()
+                .filter(|descendent_oid| graph.nodes.contains_key(descendent_oid))
+                .copied()
+                .collect(),
+        };
+        for (child_idx, child_oid) in children.iter().chain(descendants.iter()).enumerate() {
             if root_oids.contains(child_oid) {
                 // Will be rendered by the parent.
                 continue;
             }
 
-            if child_idx == children.len() - 1 {
+            let is_last_child = child_idx == (children.len() + descendants.len()) - 1;
+            if is_last_child {
                 let line = match last_child_line_char {
-                    Some(_) => StyledString::plain(format!(
+                    Some(_) => Some(StyledString::plain(format!(
                         "{}{}",
                         glyphs.line_with_offshoot, glyphs.slash
-                    )),
-
-                    None => StyledString::plain(glyphs.line.to_string()),
+                    ))),
+                    None => match graph.variant {
+                        SmartlogVariant::Connected => {
+                            Some(StyledString::plain(glyphs.line.to_string()))
+                        }
+                        SmartlogVariant::Sparse(_) if current_node.descendants.is_empty() => {
+                            Some(StyledString::plain(glyphs.line.to_string()))
+                        }
+                        SmartlogVariant::Sparse(_) => None,
+                    },
                 };
-                lines.push(line)
+                if let Some(line) = line {
+                    lines.push(line);
+                }
             } else {
                 lines.push(StyledString::plain(format!(
                     "{}{}",
                     glyphs.line_with_offshoot, glyphs.slash
-                )))
+                )));
             }
 
             let child_output = get_child_output(
@@ -445,7 +595,7 @@ mod render {
                 None,
             )?;
             for child_line in child_output {
-                let line = if child_idx == children.len() - 1 {
+                let line = if is_last_child {
                     match last_child_line_char {
                         Some(last_child_line_char) => StyledStringBuilder::new()
                             .append_plain(format!("{} ", last_child_line_char))
@@ -455,7 +605,14 @@ mod render {
                     }
                 } else {
                     StyledStringBuilder::new()
-                        .append_plain(format!("{} ", glyphs.line))
+                        .append_plain(format!(
+                            "{} ",
+                            if !current_node.descendants.is_empty() {
+                                glyphs.vertical_ellipsis
+                            } else {
+                                glyphs.line
+                            }
+                        ))
                         .append(child_line)
                         .build()
                 };
@@ -509,13 +666,10 @@ mod render {
             let last_child_line_char = {
                 if root_idx == root_oids.len() - 1 {
                     None
+                } else if has_real_parent(root_oids[root_idx + 1], *root_oid)? {
+                    Some(glyphs.line)
                 } else {
-                    let next_root_oid = root_oids[root_idx + 1];
-                    if has_real_parent(next_root_oid, *root_oid)? {
-                        Some(glyphs.line)
-                    } else {
-                        Some(glyphs.vertical_ellipsis)
-                    }
+                    Some(glyphs.vertical_ellipsis)
                 }
             };
 
@@ -564,8 +718,8 @@ mod render {
         /// as an offset from the current event.
         pub event_id: Option<isize>,
 
-        /// The commits to render. These commits and their ancestors up to the
-        /// main branch will be rendered.
+        /// The commits to render. These commits, plus any related commits, will
+        /// be rendered.
         pub variant: SmartlogVariant,
 
         pub resolve_revset_options: ResolveRevsetOptions,
