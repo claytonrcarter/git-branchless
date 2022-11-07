@@ -58,6 +58,7 @@ use lib::git::NonZeroOid;
 
 use self::reword::InitialCommitMessages;
 use self::smartlog::SmartlogOptions;
+pub use self::smartlog::SmartlogVariant;
 use self::test::RawTestOptions;
 
 fn rewrite_args(args: Vec<OsString>) -> Vec<OsString> {
@@ -340,7 +341,7 @@ fn do_main_and_drop_locals() -> eyre::Result<i32> {
             &git_run_info,
             &SmartlogOptions {
                 event_id,
-                revset,
+                variant: revset.unwrap_or_default(),
                 resolve_revset_options,
             },
         )?,

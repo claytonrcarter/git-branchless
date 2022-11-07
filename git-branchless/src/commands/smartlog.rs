@@ -25,7 +25,7 @@ use lib::core::node_descriptors::{
 };
 use lib::git::{GitRunInfo, Repo};
 
-pub use graph::{make_smartlog_graph, SmartlogGraph};
+pub use graph::{make_custom_smartlog_graph, make_smartlog_graph, SmartlogGraph, SmartlogVariant};
 pub use render::{render_graph, SmartlogOptions};
 
 use crate::opts::Revset;
@@ -33,6 +33,7 @@ use crate::revset::resolve_commits;
 
 mod graph {
     use std::collections::HashMap;
+    use std::str::FromStr;
 
     use eden_dag::DagAlgorithm;
     use lib::core::gc::mark_commit_reachable;
@@ -44,6 +45,8 @@ mod graph {
     use lib::core::node_descriptors::NodeObject;
     use lib::git::{Commit, Time};
     use lib::git::{NonZeroOid, Repo};
+
+    use crate::opts::Revset;
 
     /// Node contained in the smartlog commit graph.
     #[derive(Debug)]
@@ -211,7 +214,31 @@ mod graph {
         }
     }
 
-    /// Construct the smartlog graph for the repo.
+    /// What kind of smartlog is desired?
+    #[derive(Clone, Debug)]
+    pub enum SmartlogVariant {
+        /// A smartlog with all commits connected back to the main branch.
+        Connected,
+
+        /// A smartlog with only the specified set of a commits.
+        Sparse(Revset),
+    }
+
+    impl Default for SmartlogVariant {
+        fn default() -> Self {
+            SmartlogVariant::Connected
+        }
+    }
+
+    impl FromStr for SmartlogVariant {
+        type Err = std::convert::Infallible;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            Ok(Self::Sparse(Revset(s.to_string())))
+        }
+    }
+
+    /// Construct the default smartlog graph for the repo.
     #[instrument]
     pub fn make_smartlog_graph<'repo>(
         effects: &Effects,
@@ -221,12 +248,40 @@ mod graph {
         event_cursor: EventCursor,
         commits: &CommitSet,
     ) -> eyre::Result<SmartlogGraph<'repo>> {
+        make_custom_smartlog_graph(
+            effects,
+            repo,
+            dag,
+            event_replayer,
+            event_cursor,
+            commits,
+            SmartlogVariant::default(),
+        )
+    }
+
+    /// Construct a specific kind of smartlog graph for the repo.
+    #[instrument]
+    pub fn make_custom_smartlog_graph<'repo>(
+        effects: &Effects,
+        repo: &'repo Repo,
+        dag: &Dag,
+        event_replayer: &EventReplayer,
+        event_cursor: EventCursor,
+        commits: &CommitSet,
+        smartlog_variant: SmartlogVariant,
+    ) -> eyre::Result<SmartlogGraph<'repo>> {
         let (effects, _progress) = effects.start_operation(OperationType::MakeGraph);
 
         let mut graph = {
             let (effects, _progress) = effects.start_operation(OperationType::WalkCommits);
 
             let public_commits = dag.query_public_commits()?;
+
+            let commits = match smartlog_variant {
+                SmartlogVariant::Connected => commits,
+                SmartlogVariant::Sparse(_) => commits,
+            };
+
             for oid in commit_set_to_vec(commits)? {
                 mark_commit_reachable(repo, oid)?;
             }
@@ -253,9 +308,10 @@ mod render {
     use lib::core::node_descriptors::{render_node_descriptors, NodeDescriptor};
     use lib::git::{NonZeroOid, Repo};
 
-    use crate::opts::{ResolveRevsetOptions, Revset};
+    use crate::opts::ResolveRevsetOptions;
 
     use super::graph::SmartlogGraph;
+    use super::SmartlogVariant;
 
     /// Split fully-independent subgraphs into multiple graphs.
     ///
@@ -510,7 +566,7 @@ mod render {
 
         /// The commits to render. These commits and their ancestors up to the
         /// main branch will be rendered.
-        pub revset: Option<Revset>,
+        pub variant: SmartlogVariant,
 
         pub resolve_revset_options: ResolveRevsetOptions,
     }
@@ -525,7 +581,7 @@ pub fn smartlog(
 ) -> eyre::Result<ExitCode> {
     let SmartlogOptions {
         event_id,
-        revset,
+        variant,
         resolve_revset_options,
     } = options;
 
@@ -557,9 +613,9 @@ pub fn smartlog(
         &references_snapshot,
     )?;
 
-    let revset = match revset {
-        Some(revset) => revset.clone(),
-        None => Revset("draft() | branches() | @".to_string()),
+    let revset = match variant {
+        SmartlogVariant::Connected => Revset("draft() | branches() | @".to_string()),
+        SmartlogVariant::Sparse(revset) => revset.clone(),
     };
 
     let commits = match resolve_commits(effects, &repo, &mut dag, &[revset], resolve_revset_options)
@@ -577,13 +633,14 @@ pub fn smartlog(
         }
     };
 
-    let graph = make_smartlog_graph(
+    let graph = make_custom_smartlog_graph(
         effects,
         &repo,
         &dag,
         &event_replayer,
         event_cursor,
         &commits,
+        variant.clone(),
     )?;
 
     let lines = render_graph(

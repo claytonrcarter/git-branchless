@@ -6,6 +6,8 @@ use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::commands::SmartlogVariant;
+
 /// A revset expression. Can be a commit hash, branch name, or one of the
 /// various revset functions.
 #[derive(Clone, Debug)]
@@ -463,7 +465,7 @@ pub enum Command {
         /// The commits to render. These commits and their ancestors up to the
         /// main branch will be rendered.
         #[clap(value_parser)]
-        revset: Option<Revset>,
+        revset: Option<SmartlogVariant>,
 
         /// Options for resolving revset expressions.
         #[clap(flatten)]
