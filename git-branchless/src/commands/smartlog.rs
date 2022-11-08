@@ -25,15 +25,13 @@ use lib::core::node_descriptors::{
 };
 use lib::git::{GitRunInfo, Repo};
 
-pub use graph::{make_custom_smartlog_graph, make_smartlog_graph, SmartlogGraph, SmartlogVariant};
+pub use graph::{make_smartlog_graph, SmartlogGraph};
 pub use render::{render_graph, SmartlogOptions};
 
-use crate::opts::Revset;
 use crate::revset::resolve_commits;
 
 mod graph {
     use std::collections::HashMap;
-    use std::str::FromStr;
 
     use eden_dag::DagAlgorithm;
     use lib::core::gc::mark_commit_reachable;
@@ -45,8 +43,6 @@ mod graph {
     use lib::core::node_descriptors::NodeObject;
     use lib::git::{Commit, Time};
     use lib::git::{NonZeroOid, Repo};
-
-    use crate::opts::Revset;
 
     /// Node contained in the smartlog commit graph.
     #[derive(Debug)]
@@ -102,8 +98,6 @@ mod graph {
     /// Graph of commits that the user is working on.
     pub struct SmartlogGraph<'repo> {
         pub nodes: HashMap<NonZeroOid, Node<'repo>>,
-
-        pub variant: SmartlogVariant,
     }
 
     impl<'repo> SmartlogGraph<'repo> {
@@ -143,21 +137,13 @@ mod graph {
         dag: &Dag,
         public_commits: &CommitSet,
         commits: &CommitSet,
-        smartlog_variant: SmartlogVariant,
     ) -> eyre::Result<SmartlogGraph<'repo>> {
         let mut graph: HashMap<NonZeroOid, Node> = {
             let mut result = HashMap::new();
             for vertex in commit_set_to_vec(commits)? {
                 let vertex = CommitSet::from(vertex);
                 let merge_bases = dag.query().gca_all(dag.main_branch_commit.union(&vertex))?;
-                let vertices = if merge_bases.is_empty()? {
-                    vertex
-                } else {
-                    match smartlog_variant {
-                        SmartlogVariant::Connected => dag.query().range(merge_bases, vertex)?,
-                        SmartlogVariant::Sparse(_) => vertex.union(&merge_bases),
-                    }
-                };
+                let vertices = vertex.union(&merge_bases);
 
                 for oid in commit_set_to_vec(&vertices)? {
                     let object = match repo.find_commit(oid)? {
@@ -199,57 +185,41 @@ mod graph {
             let parent_vertices = dag.query().parents(CommitSet::from(*child_oid))?;
 
             // Find immediate parent-child links.
-            let (parent_oids, parents_in_graph) = match smartlog_variant {
-                SmartlogVariant::Connected => {
-                    let parent_oids = commit_set_to_vec(&parent_vertices)?;
-                    (parent_oids, CommitSet::empty())
-                }
-                SmartlogVariant::Sparse(_) => {
-                    let parents_in_graph = parent_vertices.intersection(&graph_vertices);
-                    let parent_oids = commit_set_to_vec(&parents_in_graph)?;
-                    (parent_oids, parents_in_graph)
-                }
+            let (parent_oids, parents_in_graph) = {
+                let parents_in_graph = parent_vertices.intersection(&graph_vertices);
+                let parent_oids = commit_set_to_vec(&parents_in_graph)?;
+                (parent_oids, parents_in_graph)
             };
             for parent_oid in parent_oids {
                 immediate_links.push((*child_oid, parent_oid))
             }
-            match smartlog_variant {
-                SmartlogVariant::Connected => {
-                    // No need to find non-immediate links.
-                }
-                SmartlogVariant::Sparse(_)
-                    if parent_vertices.count()? == parents_in_graph.count()? =>
-                {
-                    // All parents have been handled, no need to look for
-                    // non-immediate links
-                }
-                SmartlogVariant::Sparse(_) => {
-                    // Find non-immediate ancestor links.
-                    let excluded_parents = parent_vertices.difference(&graph_vertices);
-                    let excluded_parent_oids = commit_set_to_vec(&excluded_parents)?;
-                    for parent_oid in excluded_parent_oids {
-                        // Find the nearest ancestor that is included in the graph and
-                        // also on the same branch.
 
-                        let parent_set = CommitSet::from(parent_oid);
-                        let merge_base = dag
-                            .query()
-                            .gca_one(dag.main_branch_commit.union(&parent_set))?;
+            if parent_vertices.count()? != parents_in_graph.count()? {
+                // Find non-immediate ancestor links.
+                let excluded_parents = parent_vertices.difference(&graph_vertices);
+                let excluded_parent_oids = commit_set_to_vec(&excluded_parents)?;
+                for parent_oid in excluded_parent_oids {
+                    // Find the nearest ancestor that is included in the graph and
+                    // also on the same branch.
 
-                        let path_to_main_branch = match merge_base {
-                            Some(merge_base) => {
-                                dag.query().range(CommitSet::from(merge_base), parent_set)?
-                            }
-                            None => CommitSet::empty(),
-                        };
-                        let nearest_branch_ancestor = dag
-                            .query()
-                            .heads_ancestors(path_to_main_branch.intersection(&graph_vertices))?;
+                    let parent_set = CommitSet::from(parent_oid);
+                    let merge_base = dag
+                        .query()
+                        .gca_one(dag.main_branch_commit.union(&parent_set))?;
 
-                        let ancestor_oids = commit_set_to_vec(&nearest_branch_ancestor)?;
-                        for ancestor_oid in ancestor_oids.iter() {
-                            non_immediate_links.push((*ancestor_oid, *child_oid));
+                    let path_to_main_branch = match merge_base {
+                        Some(merge_base) => {
+                            dag.query().range(CommitSet::from(merge_base), parent_set)?
                         }
+                        None => CommitSet::empty(),
+                    };
+                    let nearest_branch_ancestor = dag
+                        .query()
+                        .heads_ancestors(path_to_main_branch.intersection(&graph_vertices))?;
+
+                    let ancestor_oids = commit_set_to_vec(&nearest_branch_ancestor)?;
+                    for ancestor_oid in ancestor_oids.iter() {
+                        non_immediate_links.push((*ancestor_oid, *child_oid));
                     }
                 }
             }
@@ -260,48 +230,38 @@ mod graph {
             graph.get_mut(parent_oid).unwrap().children.push(*child_oid);
         }
 
-        match smartlog_variant {
-            SmartlogVariant::Connected => {
-                // A connected smartlog doesn't need to process non-immediate
-                // links or false heads.
-            }
-            SmartlogVariant::Sparse(_) => {
-                for (ancestor_oid, descendent_oid) in non_immediate_links.iter() {
-                    graph.get_mut(descendent_oid).unwrap().has_ancestors = true;
-                    graph
-                        .get_mut(ancestor_oid)
-                        .unwrap()
-                        .descendants
-                        .push(*descendent_oid);
-                }
-
-                for (oid, node) in graph.iter_mut() {
-                    let oid_set = CommitSet::from(*oid);
-                    let is_main_head = !dag.main_branch_commit.intersection(&oid_set).is_empty()?;
-                    let ancestor_of_main = node.is_main && !is_main_head;
-                    let has_descendants_in_graph =
-                        !node.children.is_empty() || !node.descendants.is_empty();
-
-                    if ancestor_of_main || has_descendants_in_graph {
-                        continue;
-                    }
-
-                    // This node has no descendants in the graph, so it's a
-                    // false head if it has *any* (non-obsolete) children.
-                    let children_not_in_graph = dag
-                        .query()
-                        .children(oid_set)?
-                        .difference(&dag.query_obsolete_commits());
-
-                    node.is_false_head = !children_not_in_graph.is_empty()?;
-                }
-            }
+        for (ancestor_oid, descendent_oid) in non_immediate_links.iter() {
+            graph.get_mut(descendent_oid).unwrap().has_ancestors = true;
+            graph
+                .get_mut(ancestor_oid)
+                .unwrap()
+                .descendants
+                .push(*descendent_oid);
         }
 
-        Ok(SmartlogGraph {
-            nodes: graph,
-            variant: smartlog_variant,
-        })
+        for (oid, node) in graph.iter_mut() {
+            let oid_set = CommitSet::from(*oid);
+            let is_main_head = !dag.main_branch_commit.intersection(&oid_set).is_empty()?;
+            let ancestor_of_main = node.is_main && !is_main_head;
+            let has_descendants_in_graph =
+                !node.children.is_empty() || !node.descendants.is_empty();
+
+            if ancestor_of_main || has_descendants_in_graph {
+                continue;
+            }
+
+            // This node has no descendants in the graph, so it's a
+            // false head if it has *any* (non-obsolete) children.
+            let children_not_in_graph = dag
+                .query()
+                .children(oid_set)?
+                .difference(&dag.query_obsolete_commits());
+
+            node.is_false_head = !children_not_in_graph.is_empty()?;
+        }
+
+        // println!("@nocommit graph is {graph:#?}");
+        Ok(SmartlogGraph { nodes: graph })
     }
 
     /// Sort children nodes of the commit graph in a standard order, for determinism
@@ -326,30 +286,6 @@ mod graph {
         }
     }
 
-    /// What kind of smartlog is desired?
-    #[derive(Clone, Debug)]
-    pub enum SmartlogVariant {
-        /// A smartlog with all commits connected back to the main branch.
-        Connected,
-
-        /// A smartlog with only the specified set of a commits.
-        Sparse(Revset),
-    }
-
-    impl Default for SmartlogVariant {
-        fn default() -> Self {
-            SmartlogVariant::Connected
-        }
-    }
-
-    impl FromStr for SmartlogVariant {
-        type Err = std::convert::Infallible;
-
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            Ok(Self::Sparse(Revset(s.to_string())))
-        }
-    }
-
     /// Construct the default smartlog graph for the repo.
     #[instrument]
     pub fn make_smartlog_graph<'repo>(
@@ -360,28 +296,6 @@ mod graph {
         event_cursor: EventCursor,
         commits: &CommitSet,
     ) -> eyre::Result<SmartlogGraph<'repo>> {
-        make_custom_smartlog_graph(
-            effects,
-            repo,
-            dag,
-            event_replayer,
-            event_cursor,
-            commits,
-            SmartlogVariant::default(),
-        )
-    }
-
-    /// Construct a specific kind of smartlog graph for the repo.
-    #[instrument]
-    pub fn make_custom_smartlog_graph<'repo>(
-        effects: &Effects,
-        repo: &'repo Repo,
-        dag: &Dag,
-        event_replayer: &EventReplayer,
-        event_cursor: EventCursor,
-        commits: &CommitSet,
-        smartlog_variant: SmartlogVariant,
-    ) -> eyre::Result<SmartlogGraph<'repo>> {
         let (effects, _progress) = effects.start_operation(OperationType::MakeGraph);
 
         let mut graph = {
@@ -389,28 +303,16 @@ mod graph {
 
             let public_commits = dag.query_public_commits()?;
 
-            let commits = match smartlog_variant {
-                SmartlogVariant::Connected => commits.clone(),
-                SmartlogVariant::Sparse(_) => {
-                    // HEAD and main head must be included
-                    commits
-                        .union(&dag.head_commit)
-                        .union(&dag.main_branch_commit)
-                }
-            };
+            // HEAD and main head must be included
+            let commits = commits
+                .union(&dag.head_commit)
+                .union(&dag.main_branch_commit);
 
             for oid in commit_set_to_vec(&commits)? {
                 mark_commit_reachable(repo, oid)?;
             }
 
-            build_graph(
-                &effects,
-                repo,
-                dag,
-                public_commits,
-                &commits,
-                smartlog_variant,
-            )?
+            build_graph(&effects, repo, dag, public_commits, &commits)?
         };
         sort_children(&mut graph);
         Ok(graph)
@@ -434,10 +336,9 @@ mod render {
     use lib::core::node_descriptors::{render_node_descriptors, NodeDescriptor};
     use lib::git::{NonZeroOid, Repo};
 
-    use crate::opts::ResolveRevsetOptions;
+    use crate::opts::{ResolveRevsetOptions, Revset};
 
     use super::graph::SmartlogGraph;
-    use super::SmartlogVariant;
 
     /// Split fully-independent subgraphs into multiple graphs.
     ///
@@ -454,10 +355,7 @@ mod render {
         let mut root_commit_oids: Vec<NonZeroOid> = graph
             .nodes
             .iter()
-            .filter(|(_oid, node)| match graph.variant {
-                SmartlogVariant::Connected => node.parent.is_none(),
-                SmartlogVariant::Sparse(_) => node.parent.is_none() && node.is_main,
-            })
+            .filter(|(_oid, node)| node.parent.is_none() && !node.has_ancestors)
             .map(|(oid, _node)| oid)
             .copied()
             .collect();
@@ -552,14 +450,13 @@ mod render {
             .filter(|child_oid| graph.nodes.contains_key(child_oid))
             .copied()
             .collect();
-        let descendants: HashSet<_> = match graph.variant {
-            SmartlogVariant::Connected => HashSet::new(),
-            SmartlogVariant::Sparse(_) => current_node
+        let descendants: HashSet<_> = {
+            current_node
                 .descendants
                 .iter()
                 .filter(|descendent_oid| graph.nodes.contains_key(descendent_oid))
                 .copied()
-                .collect(),
+                .collect()
         };
         for (child_idx, child_oid) in children.iter().chain(descendants.iter()).enumerate() {
             if root_oids.contains(child_oid) {
@@ -574,15 +471,13 @@ mod render {
                         "{}{}",
                         glyphs.line_with_offshoot, glyphs.slash
                     ))),
-                    None => match graph.variant {
-                        SmartlogVariant::Connected => {
+                    None => {
+                        if current_node.descendants.is_empty() {
                             Some(StyledString::plain(glyphs.line.to_string()))
+                        } else {
+                            None
                         }
-                        SmartlogVariant::Sparse(_) if current_node.descendants.is_empty() => {
-                            Some(StyledString::plain(glyphs.line.to_string()))
-                        }
-                        SmartlogVariant::Sparse(_) => None,
-                    },
+                    }
                 };
                 if let Some(line) = line {
                     lines.push(line);
@@ -720,18 +615,26 @@ mod render {
     }
 
     /// Options for rendering the smartlog.
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     pub struct SmartlogOptions {
         /// The point in time at which to show the smartlog. If not provided,
         /// renders the smartlog as of the current time. If negative, is treated
         /// as an offset from the current event.
         pub event_id: Option<isize>,
 
-        /// The commits to render. These commits, plus any related commits, will
-        /// be rendered.
-        pub variant: SmartlogVariant,
+        pub revset: Revset,
 
         pub resolve_revset_options: ResolveRevsetOptions,
+    }
+
+    impl Default for SmartlogOptions {
+        fn default() -> Self {
+            Self {
+                event_id: Default::default(),
+                revset: Revset::default_smartlog_revset(),
+                resolve_revset_options: Default::default(),
+            }
+        }
     }
 }
 
@@ -744,7 +647,7 @@ pub fn smartlog(
 ) -> eyre::Result<ExitCode> {
     let SmartlogOptions {
         event_id,
-        variant,
+        revset,
         resolve_revset_options,
     } = options;
 
@@ -776,13 +679,13 @@ pub fn smartlog(
         &references_snapshot,
     )?;
 
-    let revset = match variant {
-        SmartlogVariant::Connected => Revset("draft() | branches() | @".to_string()),
-        SmartlogVariant::Sparse(revset) => revset.clone(),
-    };
-
-    let commits = match resolve_commits(effects, &repo, &mut dag, &[revset], resolve_revset_options)
-    {
+    let commits = match resolve_commits(
+        effects,
+        &repo,
+        &mut dag,
+        &[revset.clone()],
+        resolve_revset_options,
+    ) {
         Ok(result) => match result.as_slice() {
             [commit_set] => commit_set.clone(),
             other => panic!(
@@ -796,14 +699,13 @@ pub fn smartlog(
         }
     };
 
-    let graph = make_custom_smartlog_graph(
+    let graph = make_smartlog_graph(
         effects,
         &repo,
         &dag,
         &event_replayer,
         event_cursor,
         &commits,
-        variant.clone(),
     )?;
 
     let lines = render_graph(
