@@ -27,7 +27,7 @@ jobs:
           override: true
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@cb2cf0cc7c5198d3364b9630e2c3d457f160790c
+        uses: Swatinem/rust-cache@6fd3edff6979b79f87531400ad694fb7f2c84b1f
 
       - name: Run `cargo fmt`
         uses: actions-rs/cargo@v1
