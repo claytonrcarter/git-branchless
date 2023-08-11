@@ -387,10 +387,11 @@ pub struct CherryPickFastOptions {
     pub reuse_parent_tree_if_possible: bool,
 }
 
-/// An error raised when attempting the `Repo::cherry_pick_fast` operation.
+/// An error raised when attempting to create create a commit via
+/// `Repo::cherry_pick_fast`.
 #[allow(missing_docs)]
 #[derive(Debug, Error)]
-pub enum CherryPickFastError {
+pub enum CreateCommitFastError {
     /// A merge conflict occurred, so the cherry-pick could not continue.
     #[error("merge conflict in {} paths", conflicting_paths.len())]
     MergeConflict {
@@ -426,7 +427,7 @@ pub enum CherryPickFastError {
 
 /// Options for `Repo::amend_fast`
 #[derive(Debug)]
-pub enum AmendFastOptions {
+pub enum AmendFastOptions<'repo> {
     /// Amend a set of paths from the current state of the working copy.
     FromWorkingCopy {
         /// The status entries for the files to amend.
@@ -437,14 +438,20 @@ pub enum AmendFastOptions {
         /// The paths to amend.
         paths: Vec<PathBuf>,
     },
+    /// Amend a set of paths from a different commit.
+    FromCommit {
+        /// The commit whose contents will be amended.
+        commit: Commit<'repo>,
+    },
 }
 
-impl AmendFastOptions {
+impl<'repo> AmendFastOptions<'repo> {
     /// Returns whether there are any paths to be amended.
     pub fn is_empty(&self) -> bool {
         match &self {
             AmendFastOptions::FromIndex { paths } => paths.is_empty(),
             AmendFastOptions::FromWorkingCopy { status_entries } => status_entries.is_empty(),
+            AmendFastOptions::FromCommit { commit } => commit.is_empty(),
         }
     }
 }
@@ -1214,7 +1221,7 @@ impl Repo {
         patch_commit: &'repo Commit,
         target_commit: &'repo Commit,
         options: &CherryPickFastOptions,
-    ) -> std::result::Result<Tree<'repo>, CherryPickFastError> {
+    ) -> std::result::Result<Tree<'repo>, CreateCommitFastError> {
         let CherryPickFastOptions {
             reuse_parent_tree_if_possible,
         } = options;
@@ -1233,7 +1240,7 @@ impl Repo {
 
         let changed_pathbufs = self
             .get_paths_touched_by_commit(patch_commit)?
-            .ok_or_else(|| CherryPickFastError::GetPatch {
+            .ok_or_else(|| CreateCommitFastError::GetPatch {
                 commit: patch_commit.get_oid(),
             })?
             .into_iter()
@@ -1252,21 +1259,21 @@ impl Repo {
                 let conflicting_paths = {
                     let mut result = HashSet::new();
                     for conflict in rebased_index.inner.conflicts().map_err(|err| {
-                        CherryPickFastError::GetConflicts {
+                        CreateCommitFastError::GetConflicts {
                             source: err,
                             commit: patch_commit.get_oid(),
                             onto: target_commit.get_oid(),
                         }
                     })? {
                         let conflict =
-                            conflict.map_err(|err| CherryPickFastError::GetConflicts {
+                            conflict.map_err(|err| CreateCommitFastError::GetConflicts {
                                 source: err,
                                 commit: patch_commit.get_oid(),
                                 onto: target_commit.get_oid(),
                             })?;
                         if let Some(ancestor) = conflict.ancestor {
                             result.insert(ancestor.path.into_path_buf().map_err(|err| {
-                                CherryPickFastError::DecodePath {
+                                CreateCommitFastError::DecodePath {
                                     source: err,
                                     item: "ancestor",
                                 }
@@ -1274,7 +1281,7 @@ impl Repo {
                         }
                         if let Some(our) = conflict.our {
                             result.insert(our.path.into_path_buf().map_err(|err| {
-                                CherryPickFastError::DecodePath {
+                                CreateCommitFastError::DecodePath {
                                     source: err,
                                     item: "our",
                                 }
@@ -1282,7 +1289,7 @@ impl Repo {
                         }
                         if let Some(their) = conflict.their {
                             result.insert(their.path.into_path_buf().map_err(|err| {
-                                CherryPickFastError::DecodePath {
+                                CreateCommitFastError::DecodePath {
                                     source: err,
                                     item: "their",
                                 }
@@ -1296,7 +1303,7 @@ impl Repo {
                     warn!("BUG: A merge conflict was detected, but there were no entries in `conflicting_paths`. Maybe the wrong index entry was used?")
                 }
 
-                return Err(CherryPickFastError::MergeConflict { conflicting_paths });
+                return Err(CreateCommitFastError::MergeConflict { conflicting_paths });
             }
             let rebased_entries: HashMap<PathBuf, Option<(NonZeroOid, FileMode)>> =
                 changed_pathbufs
@@ -1327,7 +1334,7 @@ impl Repo {
                     .collect();
             let rebased_tree_oid =
                 hydrate_tree(self, Some(&target_commit.get_tree()?), rebased_entries)
-                    .map_err(CherryPickFastError::HydrateTree)?;
+                    .map_err(CreateCommitFastError::HydrateTree)?;
             self.find_tree_or_fail(rebased_tree_oid)?
         };
         Ok(rebased_tree)
@@ -1421,10 +1428,14 @@ impl Repo {
     /// See `Repo::cherry_pick_fast` for motivation for performing the operation
     /// in-memory.
     #[instrument]
-    pub fn amend_fast(&self, parent_commit: &Commit, opts: &AmendFastOptions) -> Result<Tree> {
+    pub fn amend_fast(
+        &self,
+        parent_commit: &Commit,
+        opts: &AmendFastOptions,
+    ) -> std::result::Result<Tree, CreateCommitFastError> {
         let parent_commit_pathbufs = self
             .get_paths_touched_by_commit(parent_commit)?
-            .ok_or_else(|| Error::GetPatch {
+            .ok_or_else(|| CreateCommitFastError::GetPatch {
                 commit: parent_commit.get_oid(),
             })?
             .into_iter()
@@ -1436,6 +1447,11 @@ impl Repo {
                 AmendFastOptions::FromWorkingCopy { ref status_entries } => {
                     for entry in status_entries {
                         result.extend(entry.paths().iter().cloned());
+                    }
+                }
+                AmendFastOptions::FromCommit { commit } => {
+                    if let Some(paths) = self.get_paths_touched_by_commit(commit)? {
+                        result.extend(paths.iter().cloned());
                     }
                 }
             };
@@ -1488,6 +1504,25 @@ impl Repo {
                             ..
                         }) => Some((path.clone(), Some((oid, file_mode)))),
                         None => Some((path.clone(), None)),
+                    })
+                    .collect::<HashMap<_, _>>()
+            }
+            AmendFastOptions::FromCommit { commit } => {
+                let amended_tree = self.cherry_pick_fast(
+                    commit,
+                    parent_commit,
+                    &CherryPickFastOptions {
+                        reuse_parent_tree_if_possible: false,
+                    },
+                )?;
+                self.get_paths_touched_by_commit(commit)?
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|path| match amended_tree.get_path(path) {
+                        Ok(Some(entry)) => {
+                            Some((path.clone(), Some((entry.get_oid(), entry.get_filemode()))))
+                        }
+                        Ok(None) | Err(_) => None,
                     })
                     .collect::<HashMap<_, _>>()
             }
