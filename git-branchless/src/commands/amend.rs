@@ -300,6 +300,7 @@ pub fn amend(
                 reset: true,
                 render_smartlog: false,
             },
+            copy: false,
         };
         match execute_rebase_plan(
             effects,

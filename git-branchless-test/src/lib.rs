@@ -414,6 +414,7 @@ BUG: Expected resolved_interactive ({resolved_interactive:?}) to match interacti
                     render_smartlog: false,
                     ..Default::default()
                 },
+                copy: false,
             };
             let permissions =
                 match RebasePlanPermissions::verify_rewrite_set(dag, build_options, commits)? {
@@ -730,6 +731,7 @@ fn set_abort_trap(
                 render_smartlog: false,
                 ..Default::default()
             },
+            copy: false,
         },
     )? {
         ExecuteRebasePlanResult::Succeeded { rewritten_oids: _ } => {

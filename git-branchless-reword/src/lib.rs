@@ -290,6 +290,7 @@ pub fn reword(
             reset: false,
             render_smartlog: false,
         },
+        copy: false,
     };
     let result = execute_rebase_plan(
         effects,

@@ -73,6 +73,7 @@ pub fn r#move(
     exacts: Vec<Revset>,
     resolve_revset_options: &ResolveRevsetOptions,
     move_options: &MoveOptions,
+    copy: bool,
     fixup: bool,
     insert: bool,
 ) -> EyreExitOr<()> {
@@ -487,6 +488,7 @@ pub fn r#move(
                 force_on_disk,
                 resolve_merge_conflicts,
                 check_out_commit_options: Default::default(),
+                copy,
             };
             execute_rebase_plan(
                 effects,

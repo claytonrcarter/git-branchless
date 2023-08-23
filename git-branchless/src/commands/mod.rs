@@ -93,6 +93,7 @@ fn command_main(ctx: CommandContext, opts: Opts) -> EyreExitOr<()> {
             exact,
             resolve_revset_options,
             move_options,
+            copy,
             fixup,
             insert,
         } => git_branchless_move::r#move(
@@ -104,6 +105,7 @@ fn command_main(ctx: CommandContext, opts: Opts) -> EyreExitOr<()> {
             exact,
             &resolve_revset_options,
             &move_options,
+            copy,
             fixup,
             insert,
         )?,

@@ -481,6 +481,7 @@ To proceed anyways, run: git move -f -s 'siblings(.)",
         force_on_disk: false,
         resolve_merge_conflicts: false,
         check_out_commit_options: Default::default(),
+        copy: false,
     };
     let result = execute_rebase_plan(
         effects,

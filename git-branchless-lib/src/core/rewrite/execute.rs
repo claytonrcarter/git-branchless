@@ -499,6 +499,7 @@ mod in_memory {
             force_on_disk: _,
             resolve_merge_conflicts: _, // May be needed once we can resolve merge conflicts in memory.
             check_out_commit_options: _, // Caller is responsible for checking out to new HEAD.
+            copy: _,
         } = options;
 
         let mut current_oid = rebase_plan.first_dest_oid;
@@ -910,6 +911,7 @@ mod in_memory {
             force_on_disk: _,
             resolve_merge_conflicts: _,
             check_out_commit_options,
+            copy,
         } = options;
 
         for new_oid in rewritten_oids.values() {
@@ -994,6 +996,7 @@ mod on_disk {
             force_on_disk: _,
             resolve_merge_conflicts: _,
             check_out_commit_options: _, // Checkout happens after rebase has concluded.
+            copy: _,
         } = options;
 
         let (effects, _progress) = effects.start_operation(OperationType::InitializeRebase);
@@ -1169,6 +1172,7 @@ mod on_disk {
             force_on_disk: _,
             resolve_merge_conflicts: _,
             check_out_commit_options: _, // Checkout happens after rebase has concluded.
+            copy: _,
         } = options;
 
         match write_rebase_state_to_disk(effects, git_run_info, repo, rebase_plan, options)? {
@@ -1213,6 +1217,9 @@ pub struct ExecuteRebasePlanOptions {
 
     /// If `HEAD` was moved, the options for checking out the new `HEAD` commit.
     pub check_out_commit_options: CheckOutCommitOptions,
+
+    /// FIXME add doc
+    pub copy: bool,
 }
 
 /// The result of executing a rebase plan.
@@ -1258,6 +1265,7 @@ pub fn execute_rebase_plan(
         force_on_disk,
         resolve_merge_conflicts,
         check_out_commit_options: _,
+        copy: _,
     } = options;
 
     if !force_on_disk {

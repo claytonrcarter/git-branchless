@@ -359,6 +359,7 @@ impl Forge for PhabricatorForge<'_> {
                 render_smartlog: false,
                 ..Default::default()
             },
+            copy: false,
         };
         let permissions =
             RebasePlanPermissions::verify_rewrite_set(self.dag, build_options, &commit_set)
@@ -608,6 +609,7 @@ Differential Revision: https://phabricator.example.com/D000$(git rev-list --coun
                 render_smartlog: false,
                 ..Default::default()
             },
+            copy: false,
         };
         let permissions =
             RebasePlanPermissions::verify_rewrite_set(self.dag, build_options, &commit_set)

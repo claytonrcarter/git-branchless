@@ -331,6 +331,7 @@ pub fn restack(
             reset: false,
             render_smartlog: false,
         },
+        copy: false,
     };
     let pool = ThreadPoolBuilder::new().build()?;
     let repo_pool = RepoResource::new_pool(&repo)?;

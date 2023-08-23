@@ -90,6 +90,7 @@ pub fn sync(
             reset: false,
             render_smartlog: false,
         },
+        copy: false,
     };
     let thread_pool = ThreadPoolBuilder::new().build()?;
     let repo_pool = RepoResource::new_pool(&repo)?;

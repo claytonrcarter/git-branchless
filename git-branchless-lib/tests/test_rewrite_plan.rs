@@ -765,6 +765,7 @@ fn create_and_execute_plan(
             reset: false,
             render_smartlog: false,
         },
+        copy: false,
     };
     let git_run_info = git.get_git_run_info();
     let result = execute_rebase_plan(

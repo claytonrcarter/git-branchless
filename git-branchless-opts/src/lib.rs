@@ -513,6 +513,10 @@ pub enum Command {
         #[clap(flatten)]
         move_options: MoveOptions,
 
+        /// FIXME copy commits instead of moving (like cherry pick, but fast)
+        #[clap(action, long = "copy", conflicts_with = "fixup")]
+        copy: bool,
+
         /// Combine the moved commits and squash them into the destination commit.
         #[clap(action, short = 'F', long = "fixup", conflicts_with = "insert")]
         fixup: bool,
