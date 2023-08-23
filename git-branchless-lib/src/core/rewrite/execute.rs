@@ -927,23 +927,25 @@ mod in_memory {
             repo.detach_head(&head_info)?;
         }
 
-        move_branches(effects, git_run_info, repo, *event_tx_id, rewritten_oids)?;
+        if !copy {
+            move_branches(effects, git_run_info, repo, *event_tx_id, rewritten_oids)?;
 
-        // Call the `post-rewrite` hook only after moving branches so that we don't
-        // produce a spurious abandoned-branch warning.
-        let post_rewrite_stdin: String = rewritten_oids
-            .iter()
-            .map(|(old_oid, new_oid)| format!("{old_oid} {new_oid}\n"))
-            .collect();
-        let post_rewrite_stdin = BString::from(post_rewrite_stdin);
-        git_run_info.run_hook(
-            effects,
-            repo,
-            "post-rewrite",
-            *event_tx_id,
-            &["rebase"],
-            Some(post_rewrite_stdin),
-        )?;
+            // Call the `post-rewrite` hook only after moving branches so that we don't
+            // produce a spurious abandoned-branch warning.
+            let post_rewrite_stdin: String = rewritten_oids
+                .iter()
+                .map(|(old_oid, new_oid)| format!("{old_oid} {new_oid}\n"))
+                .collect();
+            let post_rewrite_stdin = BString::from(post_rewrite_stdin);
+            git_run_info.run_hook(
+                effects,
+                repo,
+                "post-rewrite",
+                *event_tx_id,
+                &["rebase"],
+                Some(post_rewrite_stdin),
+            )?;
+        }
 
         let exit_code = check_out_updated_head(
             effects,

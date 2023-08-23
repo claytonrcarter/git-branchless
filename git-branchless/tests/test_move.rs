@@ -19,6 +19,16 @@ fn test_move_stick() -> eyre::Result<()> {
     let test3_oid = git.commit_file("test3", 3)?;
     git.commit_file("test4", 4)?;
 
+    let stdout = git.smartlog()?;
+    insta::assert_snapshot!(stdout, @r###"
+    :
+    O 96d1c37 (master) create test2.txt
+    |
+    o 70deb1e create test3.txt
+    |
+    @ 355e173 create test4.txt
+    "###);
+
     // --on-disk
     {
         let git = git.duplicate_repo()?;
@@ -53,6 +63,7 @@ fn test_move_stick() -> eyre::Result<()> {
             &[
                 "--in-memory",
                 "--debug-dump-rebase-plan",
+                "--copy",
                 "-s",
                 &test3_oid.to_string(),
                 "-d",
@@ -94,7 +105,6 @@ fn test_move_stick() -> eyre::Result<()> {
         Attempting rebase in-memory...
         [1/2] Committed as: 4838e49 create test3.txt
         [2/2] Committed as: a248207 create test4.txt
-        branchless: processing 2 rewritten commits
         branchless: running command: <git-executable> checkout a248207402822b7396cabe0f1011d8a7ce7daf1b
         :
         O 62fc20d create test1.txt
@@ -104,6 +114,10 @@ fn test_move_stick() -> eyre::Result<()> {
         | @ a248207 create test4.txt
         |
         O 96d1c37 (master) create test2.txt
+        |
+        o 70deb1e create test3.txt
+        |
+        o 355e173 create test4.txt
         In-memory rebase succeeded.
         "###);
 
@@ -117,6 +131,10 @@ fn test_move_stick() -> eyre::Result<()> {
         | @ a248207 create test4.txt
         |
         O 96d1c37 (master) create test2.txt
+        |
+        o 70deb1e create test3.txt
+        |
+        o 355e173 create test4.txt
         "###);
     }
 
